@@ -74,6 +74,42 @@ cmake --build build --target llama-server -j
 非 Volta / 非 D256 / 非 causal / decode / 小 batch（ne[1]<256）会自动走
 llama.cpp 原生路径，无需配置。
 
+## 上下文检查点持久化（9/11 新增，`e6ad13802`）
+
+server 的 slot save/restore 原本只持久化 target 的 KV 状态：重启后 prefix
+复用全部丢失，投机解码的 draft / spec 状态更不在保存范围内。本功能让
+**上下文检查点**（server 按 `--ctx-checkpoints` 在 prefill 中建立的 prefix
+复用快照，含 target / draft / spec 三份状态）随 slot 一起落盘，重启后校验
+装回——长会话重启不必从头 prefill，投机解码的预热状态同样保留。
+
+**实现要点**：
+
+- 检查点写入独立 sidecar 文件 `<statefile>.ckpt`，主状态文件保持 llama.cpp
+  原生格式，两种格式互不耦合；
+- 每个 blob 带 CRC-32：截断靠读边界检查、位翻转靠逐 blob CRC 校验；单条
+  损坏只跳过该条，文件头 / 结构损坏则整体丢弃 sidecar（基础 slot 恢复不受
+  影响），坏数据到不了 `llama_state_seq_set_data_ext()`；
+- 默认关闭（`0`）：未启用或无 sidecar 时，save/restore 行为与原版零差异。
+
+**参数用法**：
+
+```bash
+./build/bin/llama-server \
+    ... \
+    --slot-save-path /path/to/slot-saves \
+    --slot-save-checkpoints 16
+```
+
+| 参数 | 默认 | 说明 |
+|:---|:---:|:---|
+| `--slot-save-path PATH` | 关 | slot 状态保存目录（上游已有参数，本功能依赖它） |
+| `--slot-save-checkpoints N` | `0` | 每次 slot 保存最多持久化最近 N 个检查点（0 = 关闭，上限 1024） |
+| `LLAMA_ARG_SLOT_SAVE_CHECKPOINTS` | `0` | 环境变量形式，等价于 `--slot-save-checkpoints` |
+
+保存时写入最近 N 个检查点（target + draft + spec 三份状态 blob），恢复时
+自动校验并装回 slot 的 checkpoints 列表；实际装回数量同时受
+`--ctx-checkpoints`（内存上限）约束，取两者较小值。
+
 ## 环境变量
 
 | 变量 | 默认 | 作用 |

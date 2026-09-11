@@ -80,6 +80,49 @@ cmake --build build --target llama-server -j
 Non-Volta / non-D256 / non-causal / decode / small batch (ne[1]<256) falls
 back to the llama.cpp native path automatically — no config needed.
 
+## Context checkpoint persistence (added 9/11, `e6ad13802`)
+
+The server's slot save/restore originally persists only the target KV
+state: after a restart, prefix reuse is lost, and the speculative-decoding
+draft/spec state was never in the save scope at all. This feature makes
+**context checkpoints** (the prefix-reuse snapshots the server builds during
+prefill per `--ctx-checkpoints`, holding target / draft / spec state) travel
+with the slot — a restarted server validates and reloads them, so a long
+session does not re-prefill from scratch and the spec-decode warm state
+survives.
+
+**Design notes**:
+
+- Checkpoints go to a separate sidecar file `<statefile>.ckpt`; the main
+  state file keeps the native llama.cpp format, the two stay decoupled;
+- Every blob carries a CRC-32: truncation is caught by read-bound checks,
+  bit-rot by per-blob CRC; a corrupt entry is skipped on its own, a
+  structurally broken file discards the whole sidecar (the base slot restore
+  is unaffected), so bad data never reaches
+  `llama_state_seq_set_data_ext()`;
+- Disabled by default (`0`): with it off or no sidecar present, save/restore
+  behavior is identical to upstream.
+
+**Parameter usage**:
+
+```bash
+./build/bin/llama-server \
+    ... \
+    --slot-save-path /path/to/slot-saves \
+    --slot-save-checkpoints 16
+```
+
+| Flag | Default | Notes |
+|:---|:---:|:---|
+| `--slot-save-path PATH` | off | slot state save directory (existing upstream flag; this feature builds on it) |
+| `--slot-save-checkpoints N` | `0` | persist at most the N most recent checkpoints per slot save (0 = off, max 1024) |
+| `LLAMA_ARG_SLOT_SAVE_CHECKPOINTS` | `0` | env-var form, equivalent to `--slot-save-checkpoints` |
+
+On save, the N most recent checkpoints (target + draft + spec state blobs)
+are written; on restore they are validated and reloaded into the slot's
+checkpoints list. The reload count is also capped by `--ctx-checkpoints`
+(the in-memory limit); the smaller of the two wins.
+
 ## Environment variables
 
 | Variable | Default | Effect |
