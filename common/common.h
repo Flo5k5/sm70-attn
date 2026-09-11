@@ -690,6 +690,7 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    int32_t n_slot_save_checkpoints = 0; // max number of context checkpoints to persist per slot save (0 = disabled)
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;
