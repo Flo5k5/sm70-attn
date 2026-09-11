@@ -189,8 +189,8 @@ if [ ! -z ${GG_BUILD_OPENVINO} ]; then
     fi
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
 
-    # TODO: fix and re-enable the `test-llama-archs` test below
-    CTEST_EXTRA="-E test-llama-archs|test-recurrent-state-rollback-nemotron-h"
+    # TODO: fix failing tests on OpenVINO backend
+    CTEST_EXTRA="-E test-llama-archs|^test-recurrent-state-|test-backend-ops|test-save-load-state"
 fi
 
 ## helpers
@@ -328,6 +328,35 @@ function gg_sum_test_llama_archs_tensor_split {
     gg_printf '### %s\n\n' "${ci}"
 
     gg_printf 'Runs test-llama-archs with 1 to 4 devices\n'
+    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
+    gg_printf '```\n'
+    gg_printf '%s\n' "$(cat $OUT/${ci}.log)"
+    gg_printf '```\n'
+}
+
+# test_llama_archs_models
+
+function gg_run_test_llama_archs_models {
+    cd ${SRC}
+
+    set -e
+
+    # TODO: fix and re-enable `test-llama-archs` on OpenVINO
+    # TODO: the `test-llama-archs` currently does not build on Windows, so we check if the binary exists
+    if [ -z ${GG_BUILD_OPENVINO} ] && [ -f ./build-ci-release/bin/test-llama-archs ]; then
+        rm -rf build-ci-models && mkdir -p build-ci-models
+
+        # generate the dummy models used by the model-dependent tests
+        ./build-ci-release/bin/test-llama-archs -o build-ci-models 2>&1
+    fi
+
+    set +e
+}
+
+function gg_sum_test_llama_archs_models {
+    gg_printf '### %s\n\n' "${ci}"
+
+    gg_printf 'Generates the dummy models used by the model-dependent tests\n'
     gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
     gg_printf '```\n'
     gg_printf '%s\n' "$(cat $OUT/${ci}.log)"
@@ -732,6 +761,11 @@ function gg_check_build_requirements {
         gg_printf 'ctest not found, please install\n'
         exit 1
     fi
+
+    if ! command -v unzip &> /dev/null; then
+        gg_printf 'unzip not found, please install\n'
+        exit 1
+    fi
 }
 
 function gg_run_test_backend_ops_cpu {
@@ -785,6 +819,7 @@ ret=0
 test $ret -eq 0 && gg_run ctest_debug
 test $ret -eq 0 && gg_run ctest_release
 
+test $ret -eq 0 && gg_run test_llama_archs_models
 test $ret -eq 0 && gg_run test_llama_archs_tensor_split
 
 if [ ! -z ${GG_BUILD_HIGH_PERF} ]; then

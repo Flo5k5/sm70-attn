@@ -5,11 +5,6 @@
 
 struct common_speculative;
 
-struct common_speculative_token_dist {
-    llama_tokens ids;
-    std::vector<float> probs;
-};
-
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -30,6 +25,15 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
+
+// return the max number of draft tokens from the initialized implementations
+int32_t common_speculative_n_max(const common_speculative * spec);
+
+// validate and resolve the unconditional synthetic acceptance rates
+std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
+
+// return the conditional synthetic acceptance probabilities
+const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
 
 common_params common_base_params_to_speculative(const common_params & params);
 
@@ -57,7 +61,7 @@ struct common_speculative_draft_params {
     // can be used to constraint the max draft based on the remaining context size
     int32_t n_max = -1;
 
-    llama_pos   n_past;
+    llama_pos   pos0;
     llama_token id_last;
 
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
@@ -65,12 +69,6 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
-
-    // optional sparse proposal distributions, one per draft token
-    std::vector<common_speculative_token_dist> * dists = nullptr;
-
-    float temperature = 0.0f;
-    uint32_t seed = LLAMA_DEFAULT_SEED;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
