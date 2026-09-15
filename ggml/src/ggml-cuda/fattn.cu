@@ -5,10 +5,13 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-// sm70-attn plugin: SM70 D256 prefill routed through fattn-sm70-d256.cu.
+// sm70-attn plugin (v1.0): SM70 D256 prefill routed through fattn-sm70-d256.cu.
 // (The template definition lives in fattn-mma-f16.cuh; explicit instantiations
-//  at its tail - mma_f16_case is called directly from that .cu file.)
-extern void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+//  at its tail — mma_f16_case is called directly from that .cu file.)
+// sm70-attn plugin (fattn-sm70-d256.cu, commit B: real SM70 D256 Split-D kernel)
+extern bool   ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst);
+extern size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst);
+extern void   ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -507,17 +510,9 @@ enum best_fattn_kernel {
 // sm70-attn plugin: route (SM70 + D256 + causal mask + prefill) to the SM70 D256 kernel.
 // Target shape: Qwen3.8-27B (head_dim 256, GQA 6:1, f16 KV via -ctk q4_0 -ctv f16 dequant).
 // Rollback: LLAMA_SM70_D256=0 (recompile-free).
+// The supported() / alloc_size() checks live in fattn-sm70-d256.cu (commit B).
 static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
     if (cc != GGML_CUDA_CC_VOLTA) {
-        return false;
-    }
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
-    if (Q->ne[0] != 256 || V->ne[0] != 256) {
-        return false;
-    }
-    if (!mask || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches stay on stock
         return false;
     }
     float max_bias = 0.0f;
@@ -527,13 +522,8 @@ static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
         return false;
     }
-    const char * env = getenv("LLAMA_SM70_D256");
-    if (env && atoi(env) == 0) {
-        return false;
-    }
-    return true;
+    return ggml_cuda_sm70_d256_supported(cc, dst);
 }
-
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -681,7 +671,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // sm70-attn hook: D256 prefill on SM70 -> bespoke kernel (see fattn-sm70-d256.cu).
         if (sm70_d256_supported(cc, dst)) {
             return BEST_FATTN_KERNEL_SM70_D256;
-        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -739,12 +728,17 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
+    // sm70-attn plugin (commit B): scratch = padded f16 Q/K/V + f16 output
+    // staging (see fattn-sm70-d256.cu). Self-contained; no K/V dequant
+    // extras needed (the launcher dequants K/V itself when the cache is q4_0).
+    if (kernel == BEST_FATTN_KERNEL_SM70_D256) {
+        return ggml_cuda_sm70_d256_alloc_size(dst);
+
     bool need_f16_K = false;
     bool need_f16_V = false;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_SM70_D256: // same f16 K/V dequant requirement as MMA_F16
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
