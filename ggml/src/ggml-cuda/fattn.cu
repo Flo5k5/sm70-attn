@@ -733,6 +733,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     // extras needed (the launcher dequants K/V itself when the cache is q4_0).
     if (kernel == BEST_FATTN_KERNEL_SM70_D256) {
         return ggml_cuda_sm70_d256_alloc_size(dst);
+    }
 
     bool need_f16_K = false;
     bool need_f16_V = false;
