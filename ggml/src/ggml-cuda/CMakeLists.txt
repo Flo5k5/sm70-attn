@@ -120,7 +120,6 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-HEAD
     # sm70 vendor headers (cute/cutlass/flash) resolve their internal
     # "cute/..." / "cutlass/..." includes relative to the vendor root.
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
@@ -128,7 +127,6 @@ HEAD
     endif()
 
 
-upstream/master
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
