@@ -671,6 +671,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // sm70-attn hook: D256 prefill on SM70 -> bespoke kernel (see fattn-sm70-d256.cu).
         if (sm70_d256_supported(cc, dst)) {
             return BEST_FATTN_KERNEL_SM70_D256;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
