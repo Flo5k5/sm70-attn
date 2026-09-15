@@ -524,7 +524,6 @@ static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
     }
     return ggml_cuda_sm70_d256_supported(cc, dst);
 }
-}
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
