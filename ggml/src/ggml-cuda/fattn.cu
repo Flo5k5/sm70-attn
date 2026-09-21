@@ -5,6 +5,12 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
 // sm70-attn plugin (v1.0): SM70 D256 prefill routed through fattn-sm70-d256.cu.
 // (The template definition lives in fattn-mma-f16.cuh; explicit instantiations
 //  at its tail — mma_f16_case is called directly from that .cu file.)
@@ -506,7 +512,6 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_SM70_D256 = 500, // sm70-attn plugin (fattn-sm70-d256.cu)
 };
 
-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 // sm70-attn plugin: route (SM70 + D256 + causal mask + prefill) to the SM70 D256 kernel.
 // Target shape: Qwen3.8-27B (head_dim 256, GQA 6:1, f16 KV via -ctk q4_0 -ctv f16 dequant).
 // Rollback: LLAMA_SM70_D256=0 (recompile-free).
@@ -524,6 +529,8 @@ static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
     }
     return ggml_cuda_sm70_d256_supported(cc, dst);
 }
+
+// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -760,6 +767,89 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ---------------------------------------------------------------------------
+// sm70-attn debug: per-call FLASH_ATTN_EXT output dump (layerwise ON/OFF diff).
+//
+// Env:
+//   SM70_DUMP=<path>    dump file (truncated at the first dumped call)
+//   SM70_DUMP_MAX=<n>   stop after n records (default 4096)
+//
+// Only target-model shapes (head_dim==256 && heads_q==24) are dumped; draft /
+// multimodal / other shapes are skipped. The hook sits on the COMMON dispatch
+// path, so an ON phase (sm70 kernel) and an OFF phase (stock mma_f16) produce
+// call-for-call aligned record streams: record k of A and record k of B are
+// the same (layer, chunk) invocation, which is what sm70_layer_diff.py relies
+// on for the layerwise error-growth measurement.
+//
+// Record format (little-endian):
+//   u32 magic=0x53444D37, u32 version=1, u32 call, u32 q_len,
+//   u32 ne0, u32 ne1, u32 ne2, u32 ne3, u64 nbytes, then nbytes of f32 payload.
+//
+// Zero overhead when SM70_DUMP is unset (one getenv per process).
+static void sm70_dump_attn_output(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    static const char * path = getenv("SM70_DUMP");
+    static const int max_calls = path
+        ? (getenv("SM70_DUMP_MAX") ? atoi(getenv("SM70_DUMP_MAX")) : 4096)
+        : 0;
+    if (!path) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    if (Q->ne[0] != 256 || Q->ne[2] != 24) {
+        return; // target model only
+    }
+    // CUDA graph capture in progress: a D2H memcpy to pageable host memory is
+    // not permitted during capture (llama.cpp graphs decode steps once stable,
+    // which is exactly how the 8/23 first run aborted). Captured graphs never
+    // re-enter this hook on replay either, so skipping is the only correct
+    // behavior — decode steps under graph replay are simply not dumped, while
+    // prefill chunks execute outside capture on their first call.
+    cudaStreamCaptureStatus cap_status;
+    if (cudaStreamIsCapturing(ctx.stream(), &cap_status) != cudaSuccess
+            || cap_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    static int calls = 0;
+    static FILE * f = nullptr;
+    if (calls >= max_calls) {
+        return;
+    }
+    if (!f) {
+        f = fopen(path, "wb");
+        if (!f) {
+            fprintf(stderr, "[sm70-dump] cannot open %s for writing\n", path);
+            calls = max_calls; // do not retry every call
+            return;
+        }
+    }
+    const size_t nbytes = ggml_nbytes(dst);
+    // 10 x u32 = 8 header fields + nbytes as two little-endian halves,
+    // matching struct '<8IQ' (40 bytes) in sm70_layer_diff.py.
+    const uint32_t hdr[10] = {
+        0x53444D37u, // magic
+        1u,          // version
+        (uint32_t) calls,
+        (uint32_t) Q->ne[1],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) ((uint64_t) nbytes & 0xFFFFFFFFu),
+        (uint32_t) ((uint64_t) nbytes >> 32),
+    };
+    static std::vector<uint8_t> buf;
+    if (buf.size() < sizeof(hdr) + nbytes) {
+        buf.resize(sizeof(hdr) + nbytes);
+    }
+    memcpy(buf.data(), hdr, sizeof(hdr));
+    CUDA_CHECK(cudaMemcpyAsync(buf.data() + sizeof(hdr), dst->data, nbytes,
+                               cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    if (fwrite(buf.data(), 1, sizeof(hdr) + nbytes, f) != sizeof(hdr) + nbytes) {
+        fprintf(stderr, "[sm70-dump] short write at call %d\n", calls);
+    }
+    fflush(f);
+    calls++;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -778,6 +868,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
             break;
     }
+    sm70_dump_attn_output(ctx, dst);
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

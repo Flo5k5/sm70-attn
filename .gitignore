@@ -156,3 +156,4 @@ AGENTS.local.md
 
 # local kernel-harness binary (built by verify/, not tracked)
 verify/sm70_verify
+graft-research/

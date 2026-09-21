@@ -158,6 +158,56 @@ def test_slot_erase():
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
 
+def test_slot_save_restore_with_checkpoints():
+    global server
+    server.slot_save_checkpoints = 4
+    server.start()
+
+    # a prompt long enough to span multiple batches so context checkpoints are created
+    prompt = "the quick brown fox jumps over the lazy dog. " * 8
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_tokens = res.body["timings"]["prompt_n"]
+    assert n_tokens > 0
+
+    # save slot 1 (writes the state file plus the checkpoint sidecar)
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot_ckpt.bin",
+    })
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    n_written = res.body["n_written"]
+    assert n_saved > 0
+
+    # the checkpoint sidecar is a separate file; the state file holds only the base state
+    path = os.path.join(server.slot_save_path, "slot_ckpt.bin")
+    assert os.path.getsize(path) == n_written  # the sidecar is not appended to the state file
+    sidecar = path + ".ckpt"
+    assert os.path.exists(sidecar)  # checkpoints were created and persisted
+    assert os.path.getsize(sidecar) > 0  # the sidecar is non-empty
+
+    # restore into slot 0: the sidecar must be parsed and validated without error
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "slot_ckpt.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    # the restored slot must reuse the cached prefix
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0  # some tokens were reused from the cache
+    assert res.body["timings"]["prompt_n"] < n_tokens  # fewer tokens processed than the original
+
+
 #
 # Multimodal server (mmproj loaded) slot save/restore.
 #

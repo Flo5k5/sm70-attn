@@ -26,6 +26,9 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <array>
+#include <limits>
+#include <system_error>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -733,6 +736,316 @@ struct server_slot {
         other.init_sampler();
     }
 };
+
+//
+// context checkpoint persistence (sidecar file)
+//
+// When --slot-save-checkpoints N > 0, the N most recent context checkpoints of a slot are
+// persisted alongside its slot-save file as a sidecar <statefile>.ckpt, and on restore they
+// are validated (CRC-32 + metadata) and reloaded so that prefix / speculative-decoding reuse
+// keeps working across a server restart.
+//
+// The sidecar is a separate file: the slot-save state file is left untouched, so it stays in
+// the pure llama state format (and remains readable by other tools). Layout (little-endian):
+//
+//   [header]
+//     magic          u64  SLOT_CKPT_MAGIC
+//     version        u32  1
+//     n_checkpoints  u32
+//   [per checkpoint]
+//     n_tokens       i64
+//     pos_min        i32
+//     pos_max        i32
+//     size_tgt       u64
+//     size_dft       u64
+//     size_spec      u64
+//     crc_tgt        u32
+//     crc_dft        u32
+//     crc_spec       u32
+//     data_tgt       bytes[size_tgt]  // state_seq_get_data() blob
+//     data_dft       bytes[size_dft]  // state_seq_get_data() blob (empty if no draft)
+//     data_spec      bytes[size_spec] // opaque speculative state (empty if none)
+//
+// Corruption is detected with a per-blob CRC-32 (truncation via read bounds, bit-rot via CRC).
+// A corrupt entry is skipped; a structurally broken file (truncation / bad header) discards the
+// whole sidecar. A missing or disabled sidecar is not an error - restore proceeds without
+// checkpoints.
+
+static constexpr uint64_t SLOT_CKPT_MAGIC     = 0x315654504B434C4CULL; // "LLCKPTV1" (little-endian)
+static constexpr uint32_t SLOT_CKPT_VERSION   = 1;
+static constexpr uint32_t SLOT_CKPT_COUNT_MAX = 1024;
+
+// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320); table is generated once (thread-safe).
+static const std::array<uint32_t, 256> & slot_ckpt_crc32_table() {
+    static std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    return table;
+}
+
+static uint32_t slot_ckpt_crc32(const uint8_t * data, size_t len) {
+    const auto & table = slot_ckpt_crc32_table();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static bool slot_ckpt_sidecar_write(std::ofstream & file, const void * data, size_t size) {
+    if (size > (size_t) std::numeric_limits<std::streamsize>::max()) {
+        return false;
+    }
+    file.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+    return file.good();
+}
+
+static bool slot_checkpoints_save_sidecar(const std::string & filepath, const server_slot & slot, int32_t n_max) {
+    const std::string sidecar = filepath + ".ckpt";
+
+    const auto & checkpoints = slot.prompt.checkpoints;
+    const size_t n_save = (n_max > 0) ? std::min<size_t>(checkpoints.size(), (size_t) n_max) : 0;
+
+    if (n_save == 0) {
+        // nothing to persist - drop any stale sidecar so a restore won't find it
+        std::error_code ec;
+        std::filesystem::remove(sidecar, ec);
+        return true;
+    }
+
+    std::ofstream file(std::filesystem::u8path(sidecar), std::ios::binary);
+    if (!file) {
+        SRV_WRN("failed to open checkpoint sidecar for writing: %s\n", sidecar.c_str());
+        return false;
+    }
+
+    const uint32_t n_write = (uint32_t) n_save;
+    bool ok = slot_ckpt_sidecar_write(file, &SLOT_CKPT_MAGIC, sizeof(SLOT_CKPT_MAGIC));
+    ok = ok && slot_ckpt_sidecar_write(file, &SLOT_CKPT_VERSION, sizeof(SLOT_CKPT_VERSION));
+    ok = ok && slot_ckpt_sidecar_write(file, &n_write, sizeof(n_write));
+
+    // persist the most recent n_save checkpoints (list is ordered oldest -> newest)
+    auto it = checkpoints.begin();
+    std::advance(it, checkpoints.size() - n_save);
+    for (; it != checkpoints.end() && ok; ++it) {
+        const auto & ckpt = *it;
+        const uint64_t size_tgt  = ckpt.data_tgt.size();
+        const uint64_t size_dft  = ckpt.data_dft.size();
+        const uint64_t size_spec = ckpt.data_spec.size();
+        const uint32_t crc_tgt   = slot_ckpt_crc32(ckpt.data_tgt.data(), ckpt.data_tgt.size());
+        const uint32_t crc_dft   = slot_ckpt_crc32(ckpt.data_dft.data(), ckpt.data_dft.size());
+        const uint32_t crc_spec  = slot_ckpt_crc32(ckpt.data_spec.data(), ckpt.data_spec.size());
+
+        ok = slot_ckpt_sidecar_write(file, &ckpt.n_tokens, sizeof(ckpt.n_tokens));
+        ok = ok && slot_ckpt_sidecar_write(file, &ckpt.pos_min,  sizeof(ckpt.pos_min));
+        ok = ok && slot_ckpt_sidecar_write(file, &ckpt.pos_max,  sizeof(ckpt.pos_max));
+        ok = ok && slot_ckpt_sidecar_write(file, &size_tgt,  sizeof(size_tgt));
+        ok = ok && slot_ckpt_sidecar_write(file, &size_dft,  sizeof(size_dft));
+        ok = ok && slot_ckpt_sidecar_write(file, &size_spec, sizeof(size_spec));
+        ok = ok && slot_ckpt_sidecar_write(file, &crc_tgt,   sizeof(crc_tgt));
+        ok = ok && slot_ckpt_sidecar_write(file, &crc_dft,   sizeof(crc_dft));
+        ok = ok && slot_ckpt_sidecar_write(file, &crc_spec,  sizeof(crc_spec));
+        ok = ok && slot_ckpt_sidecar_write(file, ckpt.data_tgt.data(),  ckpt.data_tgt.size());
+        ok = ok && slot_ckpt_sidecar_write(file, ckpt.data_dft.data(),  ckpt.data_dft.size());
+        ok = ok && slot_ckpt_sidecar_write(file, ckpt.data_spec.data(), ckpt.data_spec.size());
+    }
+
+    file.flush();
+    if (!file || !ok) {
+        SRV_WRN("failed to write checkpoint sidecar: %s\n", sidecar.c_str());
+        std::error_code ec;
+        std::filesystem::remove(sidecar, ec);
+        return false;
+    }
+
+    SRV_INF("saved %u context checkpoint(s) to %s\n", n_write, sidecar.c_str());
+    return true;
+}
+
+static bool slot_checkpoints_load_sidecar(
+        const std::string & filepath,
+        const server_slot & slot,
+        int32_t n_max,
+        size_t n_ctx_checkpoints,
+        std::list<common_prompt_checkpoint> & out) {
+    out.clear();
+
+    if (n_max <= 0) {
+        return true; // feature disabled
+    }
+
+    const std::string sidecar = filepath + ".ckpt";
+    std::ifstream file(std::filesystem::u8path(sidecar), std::ios::binary);
+    if (!file) {
+        return true; // no sidecar (e.g. saved without checkpoints) - restore without checkpoints
+    }
+
+    // total file size, used for bounds checks
+    file.seekg(0, std::ios::end);
+    const std::streamoff file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    if (file_size < 0) {
+        return true;
+    }
+
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint32_t n_checkpoints = 0;
+    auto read_raw = [&](void * data, size_t size) {
+        if (size > (size_t) std::numeric_limits<std::streamsize>::max()) {
+            return false;
+        }
+        file.read(static_cast<char *>(data), static_cast<std::streamsize>(size));
+        return file.gcount() == static_cast<std::streamsize>(size);
+    };
+
+    if (!read_raw(&magic, sizeof(magic)) ||
+            !read_raw(&version, sizeof(version)) ||
+            !read_raw(&n_checkpoints, sizeof(n_checkpoints))) {
+        SRV_WRN("corrupt checkpoint sidecar header: %s\n", sidecar.c_str());
+        return true;
+    }
+    if (magic != SLOT_CKPT_MAGIC || version != SLOT_CKPT_VERSION) {
+        SRV_WRN("unsupported checkpoint sidecar (magic = %016" PRIX64 ", version = %u): %s\n",
+                magic, version, sidecar.c_str());
+        return true;
+    }
+    if (n_checkpoints > SLOT_CKPT_COUNT_MAX) {
+        SRV_WRN("invalid checkpoint count %u in sidecar: %s\n", n_checkpoints, sidecar.c_str());
+        return true;
+    }
+
+    const size_t n_keep = std::min<size_t>(std::min<size_t>((size_t) n_max, n_ctx_checkpoints), (size_t) n_checkpoints);
+    if (n_keep == 0) {
+        return true; // nothing to keep
+    }
+
+    const size_t n_prompt_tokens = slot.prompt.tokens.size();
+    std::list<common_prompt_checkpoint> kept;
+
+    for (uint32_t i = 0; i < n_checkpoints; ++i) {
+        int64_t  n_tokens = 0;
+        int32_t  pos_min = 0;
+        int32_t  pos_max = 0;
+        uint64_t size_tgt = 0, size_dft = 0, size_spec = 0;
+        uint32_t crc_tgt = 0, crc_dft = 0, crc_spec = 0;
+
+        bool ok = read_raw(&n_tokens,  sizeof(n_tokens));
+        ok = ok && read_raw(&pos_min,   sizeof(pos_min));
+        ok = ok && read_raw(&pos_max,   sizeof(pos_max));
+        ok = ok && read_raw(&size_tgt,  sizeof(size_tgt));
+        ok = ok && read_raw(&size_dft,  sizeof(size_dft));
+        ok = ok && read_raw(&size_spec, sizeof(size_spec));
+        ok = ok && read_raw(&crc_tgt,   sizeof(crc_tgt));
+        ok = ok && read_raw(&crc_dft,   sizeof(crc_dft));
+        ok = ok && read_raw(&crc_spec,  sizeof(crc_spec));
+        if (!ok) {
+            SRV_WRN("truncated checkpoint sidecar at entry %u: %s\n", i, sidecar.c_str());
+            out.clear();
+            return true;
+        }
+
+        // bound-check the blob sizes against the remaining file bytes (corrupt/huge-size guard)
+        const std::streamoff pos = file.tellg();
+        size_t remaining = (pos >= 0) ? (size_t) (file_size - pos) : 0;
+        if (size_tgt > remaining) {
+            SRV_WRN("corrupt checkpoint blob size at entry %u: %s\n", i, sidecar.c_str());
+            out.clear();
+            return true;
+        }
+        remaining -= size_tgt;
+        if (size_dft > remaining) {
+            SRV_WRN("corrupt checkpoint blob size at entry %u: %s\n", i, sidecar.c_str());
+            out.clear();
+            return true;
+        }
+        remaining -= size_dft;
+        if (size_spec > remaining) {
+            SRV_WRN("corrupt checkpoint blob size at entry %u: %s\n", i, sidecar.c_str());
+            out.clear();
+            return true;
+        }
+
+        const bool keep = (i >= n_checkpoints - n_keep);
+        common_prompt_checkpoint ckpt;
+        try {
+            if (keep) {
+                ckpt.data_tgt.resize(size_tgt);
+                ok = read_raw(ckpt.data_tgt.data(), size_tgt);
+            } else {
+                ok = file.seekg((std::streamoff) size_tgt, std::ios::cur) && file.good();
+            }
+            if (ok && keep) {
+                ckpt.data_dft.resize(size_dft);
+                ok = read_raw(ckpt.data_dft.data(), size_dft);
+            } else if (ok) {
+                ok = file.seekg((std::streamoff) size_dft, std::ios::cur) && file.good();
+            }
+            if (ok && keep) {
+                ckpt.data_spec.resize(size_spec);
+                ok = read_raw(ckpt.data_spec.data(), size_spec);
+            } else if (ok) {
+                ok = file.seekg((std::streamoff) size_spec, std::ios::cur) && file.good();
+            }
+        } catch (const std::bad_alloc &) {
+            ok = false;
+        }
+        if (!ok) {
+            SRV_WRN("truncated checkpoint blob at entry %u: %s\n", i, sidecar.c_str());
+            out.clear();
+            return true;
+        }
+
+        if (!keep) {
+            continue;
+        }
+
+        // validate metadata + per-blob CRC (integrity)
+        bool valid = size_tgt > 0
+                  && n_tokens > 0
+                  && pos_min <= pos_max
+                  && n_tokens <= (int64_t) n_prompt_tokens;
+        if (valid) {
+            valid = slot_ckpt_crc32(ckpt.data_tgt.data(), ckpt.data_tgt.size()) == crc_tgt;
+        }
+        if (valid) {
+            valid = (size_dft == 0)
+                ? (crc_dft == 0)
+                : (slot_ckpt_crc32(ckpt.data_dft.data(), ckpt.data_dft.size()) == crc_dft);
+        }
+        if (valid) {
+            valid = (size_spec == 0)
+                ? (crc_spec == 0)
+                : (slot_ckpt_crc32(ckpt.data_spec.data(), ckpt.data_spec.size()) == crc_spec);
+        }
+        if (!valid) {
+            SRV_WRN("skipping corrupt context checkpoint %u in sidecar: %s\n", i, sidecar.c_str());
+            continue; // skip this entry, keep the rest
+        }
+
+        ckpt.id_task = -1; // task ids are per-run, not meaningful after restore
+        kept.push_back(std::move(ckpt));
+    }
+
+    // make sure the whole sidecar was consumed (no trailing garbage)
+    if (file.peek() != std::char_traits<char>::eof()) {
+        SRV_WRN("unexpected trailing data in checkpoint sidecar: %s\n", sidecar.c_str());
+        out.clear();
+        return true;
+    }
+
+    out = std::move(kept);
+    SRV_INF("restored %zu context checkpoint(s) from %s\n", out.size(), sidecar.c_str());
+    return true;
+}
 
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
@@ -2579,6 +2892,9 @@ private:
                         break;
                     }
 
+                    // optionally persist context checkpoints alongside the slot state
+                    slot_checkpoints_save_sidecar(filepath, *slot, params_base.n_slot_save_checkpoints);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2638,6 +2954,13 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // reload persisted context checkpoints (sidecar), if any
+                        slot_checkpoints_load_sidecar(
+                                filepath, *slot,
+                                params_base.n_slot_save_checkpoints,
+                                (size_t) params_base.n_ctx_checkpoints,
+                                slot->prompt.checkpoints);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
