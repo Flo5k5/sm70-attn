@@ -75,8 +75,19 @@ struct Sm70D256SplitDTraits {
         PvMmaAtom,
         Layout<Shape<_1, _4, _1>>,
         Tile<Int<kGroupRows>, Int<kDChunk / 4>, _4>>;
+    // RegP (Black Magic ⑤): per-warp PV. Same tiling as PvTiledMma but M is
+    // kQkWarpRows (8) instead of kGroupRows (16), so each warp multiplies its
+    // own 8 rows of P (held in registers) by the full 256-wide V instead of
+    // the pair exchanging a 16-row P tile through shared memory. QkTiledMma
+    // already validates M=kQkWarpRows with this atom+layout, so the shape is
+    // known-good.
+    using PvWarpTiledMma = TiledMMA<
+        PvMmaAtom,
+        Layout<Shape<_1, _4, _1>>,
+        Tile<Int<kQkWarpRows>, Int<kDChunk / 4>, _4>>;
     static_assert(decltype(size(QkTiledMma{}))::value == kMmaThreads);
     static_assert(decltype(size(PvTiledMma{}))::value == kMmaThreads);
+    static_assert(decltype(size(PvWarpTiledMma{}))::value == kMmaThreads);
 
     using SmemLayoutAtom = decltype(composition(
         Swizzle<3, 3, 3>{},
@@ -296,10 +307,17 @@ __device__ __forceinline__ auto reshape_kv_thread_tensor(Tensor tensor) {
     }
 }
 
-template <typename TensorScores, typename OLayout, int kOElements>
+// kRows: number of rows in this warp's o accumulator (kGroupRows=16 for the
+// stock pair-shared path, kQkWarpRows=8 for the RegP per-warp path).
+// kPerWarp: when true the warp's o accumulator covers only its own kRows rows
+// (offset by n_warp*kRows in row_scale_exchange); when false it covers the
+// whole kGroupRows group (no offset). kOChunks/kOElements are deduced from the
+// o_storage array shape.
+template <int kRows, bool kPerWarp, typename TensorScores, typename OLayout,
+          int kOChunks, int kOElements>
 __device__ __forceinline__ void splitd_n32_online_softmax(
     TensorScores &acc_s,
-    float (&o_storage)[Sm70D256SplitDTraits::kOwnedDChunks][kOElements],
+    float (&o_storage)[kOChunks][kOElements],
     OLayout o_layout,
     float (&row_max)[Sm70D256SplitDTraits::kQkRowsPerThread],
     float (&row_sum)[Sm70D256SplitDTraits::kQkRowsPerThread],
@@ -357,18 +375,20 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
     __syncthreads();
 
     if (!first_tile) {
+        const int row_scale_base = mma_group * Traits::kGroupRows
+            + (kPerWarp ? n_warp * kRows : 0);
 #pragma unroll
-        for (int d = 0; d < Traits::kOwnedDChunks; ++d) {
+        for (int d = 0; d < kOChunks; ++d) {
             auto acc_o = make_tensor(make_rmem_ptr(&o_storage[d][0]), o_layout);
             auto acc_o_rc = make_tensor(
                 acc_o.data(),
                 FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
 #pragma unroll
-            for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
+            for (int row = 0; row < kRows / 4; ++row) {
                 const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
-                    Traits::kGroupRows>(row, lane);
+                    kRows>(row, lane);
                 const float row_scale = row_scale_exchange[
-                    mma_group * Traits::kGroupRows + logical_row];
+                    row_scale_base + logical_row];
 #pragma unroll
                 for (int col = 0; col < size<1>(acc_o_rc); ++col) {
                     acc_o_rc(row, col) *= row_scale;
@@ -522,8 +542,15 @@ __device__ __forceinline__ int64_t paged_kv_thread_offset(
 // 4/8-element group (the #268 wide-load idea adapted: no page tables here,
 // so the amortization is block addressing, and nibble pairs are read as
 // aligned u16s). Dense path only (static_assert against PagedKV).
+// RegP (Black Magic ⑤): per-warp register-only P->half2 PV. When true, the
+// attention probabilities P stay in registers (each warp does its own 8-row PV
+// over the full 256-wide V) instead of round-tripping through shared memory
+// and an inter-warp __syncthreads. Default (false) keeps the stock smem-P
+// path byte-for-byte unchanged. Gated by LLAMA_SM70_REGP (default off);
+// split out of FISHLIKEXIE_BLACK_MAGIC on 2026-09-17 (⑤ concluded: correct,
+// no measurable perf gain — see graft-research/regp-debug/).
 template <typename Element, bool PagedKV, typename ElementOut = Element, bool SplitKV3 = false,
-          bool Kq4 = false, bool Vq4 = false>
+          bool Kq4 = false, bool Vq4 = false, bool RegP = false>
 __global__ __launch_bounds__(Sm70D256SplitDTraits::kNThreads, 1)
 void sm70_d256_splitd_dense_kernel(
     const Element *__restrict__ q,
@@ -625,6 +652,47 @@ void sm70_d256_splitd_dense_kernel(
 #pragma unroll
         for (int i = 0; i < kOElements; ++i) {
             o_storage[d][i] = 0.0f;
+        }
+    }
+
+    // RegP (Black Magic ⑤): per-warp PV state. o_reg holds this warp's own
+    // kQkWarpRows (8) rows for ALL kDChunks (4) D-chunks — 4 x 16 = 64 floats
+    // per thread, register-neutral vs the stock o_storage (2 x 32). Each
+    // warp runs its own 8-row PV MMA against the FULL 256-wide V (two smem
+    // phases) and reads only its own 8 rows of P from the shared P smem
+    // tile — half the P smem read traffic of the stock 16-row pair MMA.
+    // The P tile store and its barrier are unchanged (the barrier also
+    // covers the V smem stores, so the sync count matches the stock path),
+    // and every RegP-only register lives inside the RegP branch below so
+    // the stock path's register budget is untouched.
+    typename Traits::PvWarpTiledMma pv_warp_tiled_mma;
+    auto pv_warp_thread = pv_warp_tiled_mma.get_thread_slice(lane);
+    using ORegFragment = decltype(partition_fragment_C(
+        pv_warp_tiled_mma,
+        Shape<Int<Traits::kQkWarpRows>, Int<kDChunk>>{}));
+    constexpr int kORegElements = decltype(size(ORegFragment{}))::value;
+    using ORegLayout = typename ORegFragment::layout_type;
+    static_assert(kORegElements == Traits::kDChunks * 4,
+                  "per-warp O fragment must be 16 elements per thread");
+    using SFragment = decltype(partition_fragment_C(
+        qk_tiled_mma,
+        Shape<Int<Traits::kQkWarpRows>, Int<kBlockN>>{}));
+    static_assert(decltype(size(SFragment{}))::value == 8,
+                  "QK C fragment must be 8 elements per thread");
+    // NB: the per-warp PV A fragment (tPrP_reg) and its size asserts live in
+    // the RegP branch of the PV loop below — this CuTe vintage has no
+    // static partition_fragment_A free function (only the C variant), and
+    // partition_fragment_A from an identity tensor is unsupported (the
+    // fragment normalization needs integer strides). It is derived there
+    // from the warp's real 8-row subtile of the P smem tile.
+    float o_reg[Traits::kDChunks][kORegElements];
+    if constexpr (RegP) {
+#pragma unroll
+        for (int d = 0; d < Traits::kDChunks; ++d) {
+#pragma unroll
+            for (int i = 0; i < kORegElements; ++i) {
+                o_reg[d][i] = 0.0f;
+            }
         }
     }
 
@@ -851,26 +919,46 @@ void sm70_d256_splitd_dense_kernel(
             kv_smem_ptr + 2 * Traits::kKVElements;
         float *row_scale_exchange = reinterpret_cast<float *>(
             p_smem_ptr + Traits::kPElements);
-        splitd_n32_online_softmax(
-            acc_s, o_storage, OLayout{}, row_max, row_sum,
-            row_scale_exchange, mma_group, n_warp, lane,
-            softmax_scale_log2, n_block == n_block_max);
+        if constexpr (RegP) {
+            splitd_n32_online_softmax<Traits::kQkWarpRows, true>(
+                acc_s, o_reg, ORegLayout{}, row_max, row_sum,
+                row_scale_exchange, mma_group, n_warp, lane,
+                softmax_scale_log2, n_block == n_block_max);
+        } else {
+            splitd_n32_online_softmax<Traits::kGroupRows, false>(
+                acc_s, o_storage, OLayout{}, row_max, row_sum,
+                row_scale_exchange, mma_group, n_warp, lane,
+                softmax_scale_log2, n_block == n_block_max);
+        }
 
         store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
         store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
 
+        // P fragment handling: both paths stage the pair's 16-row P tile
+        // into shared memory (each warp writes its own 8 rows); the stock
+        // path loads it back as the 16-row pair MMA's A fragment (tPrP),
+        // while RegP loads only this warp's own 8 rows (tPrP_reg, declared
+        // in the PV branch below). The barrier makes the P stores — and
+        // the V smem stores above — visible before the PV gemms read them.
         auto sP = make_tensor(
             make_smem_ptr(p_smem_ptr), typename Traits::SmemLayoutP{});
-        auto cS = make_identity_tensor(
-            Shape<Int<Traits::kQkWarpRows>, Int<kBlockN>>{});
-        auto tScS = qk_mma_thread.partition_C(cS);
+        auto sPGroup = local_tile(
+            sP,
+            Shape<Int<Traits::kGroupRows>, Int<kBlockN>>{},
+            make_coord(mma_group, 0));
+        auto tPrP = pv_mma_thread.partition_fragment_A(sPGroup);
+        {
+            auto cS = make_identity_tensor(
+                Shape<Int<Traits::kQkWarpRows>, Int<kBlockN>>{});
+            auto tScS = qk_mma_thread.partition_C(cS);
 #pragma unroll
-        for (int i = 0; i < size(acc_s); ++i) {
-            const int row = get<0>(tScS(i));
-            const int col = get<1>(tScS(i));
-            sP(qk_row_base + row, col) = Element(acc_s(i));
+            for (int i = 0; i < size(acc_s); ++i) {
+                const int row = get<0>(tScS(i));
+                const int col = get<1>(tScS(i));
+                sP(qk_row_base + row, col) = Element(acc_s(i));
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         auto gV1 = local_tile(
             mV,
@@ -913,74 +1001,184 @@ void sm70_d256_splitd_dense_kernel(
             copy_even_tile(gmem_v_copy, tVgV3, tVrV1);
         }
 
-        auto sPGroup = local_tile(
-            sP,
-            Shape<Int<Traits::kGroupRows>, Int<kBlockN>>{},
-            make_coord(mma_group, 0));
-        auto tPrP = pv_mma_thread.partition_fragment_A(sPGroup);
-        auto tOsP = pv_mma_thread.partition_A(sPGroup);
-        auto smem_copy_p = make_tiled_copy_A(
-            typename Traits::SmemCopyAtom{}, pv_tiled_mma);
-        auto smem_thread_p = smem_copy_p.get_thread_slice(lane);
-        auto tPsP = smem_thread_p.retile_S(tOsP);
-        auto tPrPView = smem_thread_p.retile_D(tPrP);
+        if constexpr (RegP) {
+            // Per-warp PV (Black Magic ⑤): each warp multiplies its own
+            // 8-row P by the FULL 256-wide V. The A fragment is loaded from
+            // only this warp's 8 rows of the shared P tile — half the P
+            // smem read traffic of the stock 16-row pair load. Phase 1
+            // uses the current smem V buffers (chunk0 in the first buffer,
+            // chunk2 in the second); phase 2 uses the refreshed buffers
+            // (chunk1, chunk3); both warps read both V buffers in each
+            // phase.
+            // local_tile's row coord is a TILE index into the 8-row tiling
+            // of the 64-row P tile (one tile per warp), not a row index --
+            // same convention as sQChunk (warp index) and sPGroup
+            // (mma_group over 16-row tiles). A row index here multiplies by
+            // the full 256-half tile size and reads past the P tile.
+            auto sPWarp = local_tile(
+                sP,
+                Shape<Int<Traits::kQkWarpRows>, Int<kBlockN>>{},
+                make_coord(mma_group * Traits::kWarpsPerGroup + n_warp, 0));
+            auto tPrP_reg = pv_warp_thread.partition_fragment_A(sPWarp);
+            using ARegFragment = decltype(tPrP_reg);
+            static_assert(decltype(size(ARegFragment{}))::value == 32,
+                          "per-warp PV A fragment must be 32 elements per thread");
+            static_assert(decltype(size<2>(ARegFragment{}))::value
+                          == kBlockN / 4,
+                          "per-warp PV A fragment must have 8 K-tiles");
+            auto tOsPW = pv_warp_thread.partition_A(sPWarp);
+            auto smem_copy_pw = make_tiled_copy_A(
+                typename Traits::SmemCopyAtom{}, pv_warp_tiled_mma);
+            auto smem_thread_pw = smem_copy_pw.get_thread_slice(lane);
+            auto tPsPW = smem_thread_pw.retile_S(tOsPW);
+            auto tPrPViewW = smem_thread_pw.retile_D(tPrP_reg);
 #pragma unroll
-        for (int k_tile = 0; k_tile < size<2>(tPrP); ++k_tile) {
-            cute::copy(
-                smem_copy_p,
-                tPsP(_, _, k_tile),
-                tPrPView(_, _, k_tile));
-        }
-
-#pragma unroll
-        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
-            auto acc_o = make_tensor(
-                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
-            auto sV = make_tensor(
-                make_smem_ptr(
-                    kv_smem_ptr + n_warp * Traits::kKVElements),
-                typename Traits::SmemLayoutV{});
-            splitd_pv_gemm_tt(
-                acc_o, tPrP, sV, pv_tiled_mma, lane);
+            for (int k_tile = 0; k_tile < size<2>(tPrP_reg); ++k_tile) {
+                cute::copy(
+                    smem_copy_pw,
+                    tPsPW(_, _, k_tile),
+                    tPrPViewW(_, _, k_tile));
+            }
+            {
+                auto sV0 = make_tensor(
+                    make_smem_ptr(kv_smem_ptr),
+                    typename Traits::SmemLayoutV{});
+                auto sV1 = make_tensor(
+                    make_smem_ptr(kv_smem_ptr + Traits::kKVElements),
+                    typename Traits::SmemLayoutV{});
+                auto acc_o0 = make_tensor(
+                    make_rmem_ptr(&o_reg[0][0]), ORegLayout{});
+                auto acc_o2 = make_tensor(
+                    make_rmem_ptr(&o_reg[2][0]), ORegLayout{});
+                splitd_pv_gemm_tt(
+                    acc_o0, tPrP_reg, sV0, pv_warp_tiled_mma, lane);
+                splitd_pv_gemm_tt(
+                    acc_o2, tPrP_reg, sV1, pv_warp_tiled_mma, lane);
+            }
             __syncthreads();
-            if (d_local + 1 < Traits::kOwnedDChunks) {
-                store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
-                store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
+            store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
+            store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
+            __syncthreads();
+            if (n_block > n_block_min) {
+                if constexpr (Kq4) {
+                    sm70_q4_fill_kv<4>(
+                        k_q4_head_base, k_row_stride,
+                        (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
+                } else {
+                    auto gKNextBlock = local_tile(
+                        mK,
+                        Shape<Int<kBlockN>, Int<kDChunk>>{},
+                        make_coord(n_block - 1, 0));
+                    auto tKgKNextBlockRaw =
+                        gmem_k_thread.partition_S(gKNextBlock);
+                    auto tKgKNextBlock =
+                        reshape_kv_thread_tensor<PagedKV>(
+                            tKgKNextBlockRaw);
+                    if constexpr (PagedKV) {
+                        tKgKNextBlock.data() = mK.data()
+                            + paged_kv_thread_offset<
+                                  Traits::kGmemKThreadsPerRow,
+                                  Traits::kGmemKRowsPerThread,
+                                  Traits::kGmemKElemsPerLoad>(
+                                  tid, n_block - 1, 0, page_size,
+                                  sequence_block_table, k_outer_stride,
+                                  k_row_stride);
+                    }
+                    copy_even_tile(
+                        gmem_k_copy, tKgKNextBlock, tKrKNext);
+                }
+            }
+            {
+                auto sV0 = make_tensor(
+                    make_smem_ptr(kv_smem_ptr),
+                    typename Traits::SmemLayoutV{});
+                auto sV1 = make_tensor(
+                    make_smem_ptr(kv_smem_ptr + Traits::kKVElements),
+                    typename Traits::SmemLayoutV{});
+                auto acc_o1 = make_tensor(
+                    make_rmem_ptr(&o_reg[1][0]), ORegLayout{});
+                auto acc_o3 = make_tensor(
+                    make_rmem_ptr(&o_reg[3][0]), ORegLayout{});
+                splitd_pv_gemm_tt(
+                    acc_o1, tPrP_reg, sV0, pv_warp_tiled_mma, lane);
+                splitd_pv_gemm_tt(
+                    acc_o3, tPrP_reg, sV1, pv_warp_tiled_mma, lane);
+            }
+            if (n_block > n_block_min) {
+                // sK and sV0 share one smem region (both rooted at kv_smem_ptr).
+                // The K copy writes into sK (= sV0's smem), so it must not begin
+                // until every warp has finished the phase-2 V reads of sV0/sV1.
+                // The stock path gets this ordering for free from the d_local
+                // loop's trailing sync; the RegP path needs it explicitly here.
                 __syncthreads();
-                if (n_block > n_block_min) {
-                    if constexpr (Kq4) {
-                        sm70_q4_fill_kv<4>(
-                            k_q4_head_base, k_row_stride,
-                            (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
-                    } else {
-                        auto gKNextBlock = local_tile(
-                            mK,
-                            Shape<Int<kBlockN>, Int<kDChunk>>{},
-                            make_coord(n_block - 1, 0));
-                        auto tKgKNextBlockRaw =
-                            gmem_k_thread.partition_S(gKNextBlock);
-                        auto tKgKNextBlock =
-                            reshape_kv_thread_tensor<PagedKV>(
-                                tKgKNextBlockRaw);
-                        if constexpr (PagedKV) {
-                            tKgKNextBlock.data() = mK.data()
-                                + paged_kv_thread_offset<
-                                      Traits::kGmemKThreadsPerRow,
-                                      Traits::kGmemKRowsPerThread,
-                                      Traits::kGmemKElemsPerLoad>(
-                                      tid, n_block - 1, 0, page_size,
-                                      sequence_block_table, k_outer_stride,
-                                      k_row_stride);
+                cute::copy(tKrKNext, tKsK);
+                __syncthreads();
+            }
+        } else {
+            auto tOsP = pv_mma_thread.partition_A(sPGroup);
+            auto smem_copy_p = make_tiled_copy_A(
+                typename Traits::SmemCopyAtom{}, pv_tiled_mma);
+            auto smem_thread_p = smem_copy_p.get_thread_slice(lane);
+            auto tPsP = smem_thread_p.retile_S(tOsP);
+            auto tPrPView = smem_thread_p.retile_D(tPrP);
+#pragma unroll
+            for (int k_tile = 0; k_tile < size<2>(tPrP); ++k_tile) {
+                cute::copy(
+                    smem_copy_p,
+                    tPsP(_, _, k_tile),
+                    tPrPView(_, _, k_tile));
+            }
+#pragma unroll
+            for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+                auto acc_o = make_tensor(
+                    make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+                auto sV = make_tensor(
+                    make_smem_ptr(
+                        kv_smem_ptr + n_warp * Traits::kKVElements),
+                    typename Traits::SmemLayoutV{});
+                splitd_pv_gemm_tt(
+                    acc_o, tPrP, sV, pv_tiled_mma, lane);
+                __syncthreads();
+                if (d_local + 1 < Traits::kOwnedDChunks) {
+                    store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
+                    store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
+                    __syncthreads();
+                    if (n_block > n_block_min) {
+                        if constexpr (Kq4) {
+                            sm70_q4_fill_kv<4>(
+                                k_q4_head_base, k_row_stride,
+                                (n_block - 1) * kBlockN, 0, tKrKNext, tKcK);
+                        } else {
+                            auto gKNextBlock = local_tile(
+                                mK,
+                                Shape<Int<kBlockN>, Int<kDChunk>>{},
+                                make_coord(n_block - 1, 0));
+                            auto tKgKNextBlockRaw =
+                                gmem_k_thread.partition_S(gKNextBlock);
+                            auto tKgKNextBlock =
+                                reshape_kv_thread_tensor<PagedKV>(
+                                    tKgKNextBlockRaw);
+                            if constexpr (PagedKV) {
+                                tKgKNextBlock.data() = mK.data()
+                                    + paged_kv_thread_offset<
+                                          Traits::kGmemKThreadsPerRow,
+                                          Traits::kGmemKRowsPerThread,
+                                          Traits::kGmemKElemsPerLoad>(
+                                          tid, n_block - 1, 0, page_size,
+                                          sequence_block_table,
+                                          k_outer_stride,
+                                          k_row_stride);
+                            }
+                            copy_even_tile(
+                                gmem_k_copy, tKgKNextBlock, tKrKNext);
                         }
-                        copy_even_tile(
-                            gmem_k_copy, tKgKNextBlock, tKrKNext);
                     }
                 }
             }
-        }
-        if (n_block > n_block_min) {
-            cute::copy(tKrKNext, tKsK);
-            __syncthreads();
+            if (n_block > n_block_min) {
+                cute::copy(tKrKNext, tKsK);
+                __syncthreads();
+            }
         }
     }
 
@@ -1021,27 +1219,54 @@ void sm70_d256_splitd_dense_kernel(
             }
         }
 
+        if constexpr (RegP) {
 #pragma unroll
-        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
-            auto acc_o = make_tensor(
-                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
-            auto cO = make_identity_tensor(
-                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
-            auto tOcO = pv_mma_thread.partition_C(cO);
+            for (int d_chunk = 0; d_chunk < Traits::kDChunks; ++d_chunk) {
+                auto acc_o = make_tensor(
+                    make_rmem_ptr(&o_reg[d_chunk][0]), ORegLayout{});
+                auto cO = make_identity_tensor(
+                    Shape<Int<Traits::kQkWarpRows>, Int<kDChunk>>{});
+                auto tOcO = pv_warp_thread.partition_C(cO);
 #pragma unroll
-            for (int i = 0; i < size(acc_o); ++i) {
-                const int row = get<0>(tOcO(i));
-                const int col = get<1>(tOcO(i));
-                const int query_row = query_row_base + group_row_base + row;
-                const int64_t row_offset =
-                    (static_cast<int64_t>(batch) * query_len + query_row)
-                        * heads_q
-                    + head_q;
-                const int64_t partial_row =
-                    split * split_row_stride + row_offset;
-                const int d =
-                    (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
-                partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
+                for (int i = 0; i < size(acc_o); ++i) {
+                    const int row = get<0>(tOcO(i));
+                    const int col = get<1>(tOcO(i));
+                    const int query_row = query_row_base
+                        + group_row_base + n_warp * Traits::kQkWarpRows + row;
+                    const int64_t row_offset =
+                        (static_cast<int64_t>(batch) * query_len + query_row)
+                            * heads_q
+                            + head_q;
+                    const int64_t partial_row =
+                        split * split_row_stride + row_offset;
+                    const int d = d_chunk * kDChunk + col;
+                    partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+                auto acc_o = make_tensor(
+                    make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+                auto cO = make_identity_tensor(
+                    Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+                auto tOcO = pv_mma_thread.partition_C(cO);
+#pragma unroll
+                for (int i = 0; i < size(acc_o); ++i) {
+                    const int row = get<0>(tOcO(i));
+                    const int col = get<1>(tOcO(i));
+                    const int query_row = query_row_base + group_row_base + row;
+                    const int64_t row_offset =
+                        (static_cast<int64_t>(batch) * query_len + query_row)
+                            * heads_q
+                            + head_q;
+                    const int64_t partial_row =
+                        split * split_row_stride + row_offset;
+                    const int d =
+                        (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk
+                        + col;
+                    partial_out[partial_row * Traits::kHeadDim + d] = acc_o(i);
+                }
             }
         }
     } else {
@@ -1059,38 +1284,82 @@ void sm70_d256_splitd_dense_kernel(
 
         const int64_t out_batch_offset =
             static_cast<int64_t>(batch) * query_len * heads_q * Traits::kHeadDim;
+        if constexpr (RegP) {
+            // Per-warp O: this warp's own kQkWarpRows (8) rows, all
+            // kDChunks (4) D-chunks.
 #pragma unroll
-        for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
-            auto acc_o = make_tensor(
-                make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
-            auto acc_o_rc = make_tensor(
-                acc_o.data(),
-                FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+            for (int d_chunk = 0; d_chunk < Traits::kDChunks; ++d_chunk) {
+                auto acc_o = make_tensor(
+                    make_rmem_ptr(&o_reg[d_chunk][0]), ORegLayout{});
+                auto acc_o_rc = make_tensor(
+                    acc_o.data(),
+                    FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
 #pragma unroll
-            for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
-                const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
-                    Traits::kGroupRows>(row, lane);
-                const float inv_sum = 1.0f / row_sum_exchange[
-                    mma_group * Traits::kGroupRows + logical_row];
+                for (int row = 0; row < Traits::kQkWarpRows / 4; ++row) {
+                    const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
+                        Traits::kQkWarpRows>(row, lane);
+                    const float inv_sum = 1.0f / row_sum_exchange[
+                        mma_group * Traits::kGroupRows
+                        + n_warp * Traits::kQkWarpRows + logical_row];
 #pragma unroll
-                for (int col = 0; col < size<1>(acc_o_rc); ++col) {
-                    acc_o_rc(row, col) *= inv_sum;
+                    for (int col = 0; col < size<1>(acc_o_rc); ++col) {
+                        acc_o_rc(row, col) *= inv_sum;
+                    }
+                }
+
+                auto cO = make_identity_tensor(
+                    Shape<Int<Traits::kQkWarpRows>, Int<kDChunk>>{});
+                auto tOcO = pv_warp_thread.partition_C(cO);
+#pragma unroll
+                for (int i = 0; i < size(acc_o); ++i) {
+                    const int row = get<0>(tOcO(i));
+                    const int col = get<1>(tOcO(i));
+                    const int query_row = query_row_base
+                        + group_row_base + n_warp * Traits::kQkWarpRows + row;
+                    const int64_t offset = out_batch_offset
+                        + static_cast<int64_t>(query_row) * heads_q
+                          * Traits::kHeadDim
+                        + head_q * Traits::kHeadDim
+                        + d_chunk * kDChunk + col;
+                    out[offset] = ElementOut(acc_o(i));
                 }
             }
-
-            auto cO = make_identity_tensor(
-                Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
-            auto tOcO = pv_mma_thread.partition_C(cO);
+        } else {
 #pragma unroll
-            for (int i = 0; i < size(acc_o); ++i) {
-                const int row = get<0>(tOcO(i));
-                const int col = get<1>(tOcO(i));
-                const int query_row = query_row_base + group_row_base + row;
-                const int64_t offset = out_batch_offset
-                    + static_cast<int64_t>(query_row) * heads_q * Traits::kHeadDim
-                    + head_q * Traits::kHeadDim
-                    + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk + col;
-                out[offset] = ElementOut(acc_o(i));
+            for (int d_local = 0; d_local < Traits::kOwnedDChunks; ++d_local) {
+                auto acc_o = make_tensor(
+                    make_rmem_ptr(&o_storage[d_local][0]), OLayout{});
+                auto acc_o_rc = make_tensor(
+                    acc_o.data(),
+                    FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+#pragma unroll
+                for (int row = 0; row < Traits::kOutputRowsPerThread; ++row) {
+                    const int logical_row = FLASH_NAMESPACE::sm70_row_slot<
+                        Traits::kGroupRows>(row, lane);
+                    const float inv_sum = 1.0f / row_sum_exchange[
+                        mma_group * Traits::kGroupRows + logical_row];
+#pragma unroll
+                    for (int col = 0; col < size<1>(acc_o_rc); ++col) {
+                        acc_o_rc(row, col) *= inv_sum;
+                    }
+                }
+
+                auto cO = make_identity_tensor(
+                    Shape<Int<Traits::kGroupRows>, Int<kDChunk>>{});
+                auto tOcO = pv_mma_thread.partition_C(cO);
+#pragma unroll
+                for (int i = 0; i < size(acc_o); ++i) {
+                    const int row = get<0>(tOcO(i));
+                    const int col = get<1>(tOcO(i));
+                    const int query_row = query_row_base + group_row_base + row;
+                    const int64_t offset = out_batch_offset
+                        + static_cast<int64_t>(query_row) * heads_q
+                          * Traits::kHeadDim
+                        + head_q * Traits::kHeadDim
+                        + (n_warp * Traits::kOwnedDChunks + d_local) * kDChunk
+                          + col;
+                    out[offset] = ElementOut(acc_o(i));
+                }
             }
         }
     }
