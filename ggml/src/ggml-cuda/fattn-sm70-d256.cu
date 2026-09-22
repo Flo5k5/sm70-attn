@@ -41,7 +41,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-sm70-d256-kernel.cuh"
-#include "blackmagic.h"
 #include <cstdio>
 #include <vector>
 
@@ -164,19 +163,6 @@ static bool sm70_env_disabled() {
     return disabled;
 }
 
-// RegP (per-warp register-only PV) — its OWN gate, default OFF. Split out of
-// FISHLIKEXIE_BLACK_MAGIC on 2026-09-17: the ⑤ experiment concluded (correct,
-// bit-identical to stock D256, but no measurable perf gain), so it no longer
-// shares the master Black Magic switch. FISHLIKEXIE_BLACK_MAGIC is reserved
-// for the remaining experimental features (①③④⑥). Explicit "1" opts in.
-static bool regp_env_on() {
-    static const bool enabled = [] {
-        const char * e = getenv("LLAMA_SM70_REGP");
-        return e && e[0] == '1';
-    }();
-    return enabled;
-}
-
 // q4-direct (8/23, from the 1Cat XQA <KV_DTYPE> load architecture): q4_0 K/V
 // blocks are dequantized IN-KERNEL instead of staging the whole cache to an
 // f16 mirror per call. Kernel rounding is bit-identical to the staged path
@@ -193,46 +179,6 @@ static bool sm70_q4_direct() {
         return e && e[0] == '1';
     }();
     return enabled;
-}
-
-// Feature ⑥ (2026-09-17): small-prefill D256 — lower the q_len gate.
-//
-// WHY the gate was q_len >= 256 (investigated before changing it, per the
-// user directive to research the origin first):
-//   * v1.0 (2026-08-18) routed to the STOCK kernel via the fixed template
-//     <256,256,32,2>. The stock switch (ggml_cuda_flash_attn_ext_mma_f16_
-//     switch_ncols1, ncols2=2) picks ncols1=32 for ANY q_len > 16
-//     (q_len<=8->8, q_len<=16->16, else 32). v1.0's own header comment
-//     records this ("ne[1]>16 -> case <256,256,32,2>"). So 256 was NEVER a
-//     correctness requirement of that template — it was a conservative
-//     "prefill only" scoping choice: 256 ~ the production prefill chunk size
-//     (ub 256-512); decode/MTP (q_len=1) and small batches were deliberately
-//     left on stock.
-//   * v1.1 (2026-08-19) swapped in the real Split-D kernel and kept the same
-//     gate. The kernel pads q_len to a multiple of SM70_D256_BLOCK_M=64, so
-//     it structurally supports ANY q_len >= 1 (the padding path is already
-//     exercised by the 16k A/B: last chunk q_len=328 -> q_pad=384). Perf was
-//     only validated at 46k/176k — the small-q_len region was never A/B'd.
-//   * The kv_len >= 256 half of the gate (mask->ne[0], added in ce67442e4)
-//     mirrors the q_len threshold as a conservative "untested region" guard;
-//     the real correctness guard is the separate Q->ne[1] > mask->ne[0] check
-//     (prevents a negative kv_offset).
-//
-// The production follow-up (LCP reuse) arrives as a prefill chunk of
-// q_len ~ 77 over kv_len ~ 112K — the 256 gate sends it to stock FA, which is
-// the real 19.7 ms/token bottleneck. Feature ⑥ lowers the q_len threshold for
-// small-prefill chunks when FISHLIKEXIE_BLACK_MAGIC=1 (experimental; default-
-// off so production is untouched). The kv_len gate stays at 256 (the follow-
-// up's kv_len is 112K, so it is not the blocker).
-//
-// min_q = 17: the stock switch's ncols1=32 boundary (q_len > 16) — covers the
-// ~77-token follow-up while excluding decode (q_len=1) and tiny prefill
-// (q_len 2-16) where a 64-row tile is wasteful.
-static int sm70_d256_min_q() {
-    static const int min_q = [] {
-        return black_magic_on() ? 17 : 256;
-    }();
-    return min_q;
 }
 
 // 8/23 cause hunt: capture the FIRST sm70 invocation's actual kernel inputs
@@ -366,7 +312,7 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         sm70_d256_probe("REJECT: head_dim != 256", cc, Q, K, V, mask);
         return false;
     }
-    if (!mask || mask->ne[0] < 256 || Q->ne[1] < sm70_d256_min_q()) { // prefill only; decode/MTP/small batches -> stock (min_q=17 under FISHLIKEXIE_BLACK_MAGIC, else 256)
+    if (!mask || mask->ne[0] < 256 || Q->ne[1] < 256) { // prefill only; decode/MTP/small batches -> stock
         sm70_d256_probe("REJECT: no mask or small batch", cc, Q, K, V, mask);
         return false;
     }
@@ -410,26 +356,11 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
             return false;
         }
     }
-    // small_prefill: q_len < 256 — only reachable when FISHLIKEXIE_BLACK_MAGIC=1
-    // lowered the gate (sm70_d256_min_q()==17). Surface it so an A/B run can
-    // confirm the small-prefill path is really taken (Feature ⑥).
-    const bool small_prefill = (Q->ne[1] < 256);
-    const char * base_reason =
+    sm70_d256_probe(
         (K->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q4_0) && sm70_q4_direct()
             ? "ACCEPT: sm70 d256 + q4-direct"
-            : "ACCEPT: sm70 d256 kernel selected";
-    if (regp_env_on()) {
-        // RegP active (LLAMA_SM70_REGP=1): the launcher will pick the RegP
-        // (register-only P) kernel set. Surface it in the routing log so an
-        // A/B run can confirm the experimental path is really taken.
-        sm70_d256_probe(small_prefill
-                    ? "ACCEPT: sm70 d256 + RegP + small-prefill (FISHLIKEXIE_BLACK_MAGIC)"
-                    : "ACCEPT: sm70 d256 + RegP (LLAMA_SM70_REGP)", cc, Q, K, V, mask);
-    } else {
-        sm70_d256_probe(small_prefill
-                    ? "ACCEPT: sm70 d256 + small-prefill (FISHLIKEXIE_BLACK_MAGIC)"
-                    : base_reason, cc, Q, K, V, mask);
-    }
+            : "ACCEPT: sm70 d256 kernel selected",
+        cc, Q, K, V, mask);
     return true;
 }
 
@@ -617,33 +548,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     auto kernel_s3_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true>;
     auto kernel_s3_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  true>;
 
-    // Black Magic ⑤ (RegP): register-only softmax->PV. Each warp keeps its
-    // own 8-row P in registers (converted from the QK C fragment by a
-    // precomputed lane permutation) and multiplies it against the FULL
-    // 256-wide V over two smem phases, eliminating the P smem store/load
-    // round-trip and its __syncthreads. Identical inputs, outputs, smem
-    // layout, and scratch layout to the stock path — only the kernel
-    // selection differs. Gate: LLAMA_SM70_REGP=1 (default 0).
-    const bool use_regp = regp_env_on();
-    auto regp_00  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, false, true>;
-    auto regp_10  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  false, true>;
-    auto regp_01  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, false, true,  true>;
-    auto regp_11  = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, false, true,  true,  true>;
-    auto regp_s3_00 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, false, true>;
-    auto regp_s3_10 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  false, true>;
-    auto regp_s3_01 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, false, true,  true>;
-    auto regp_s3_11 = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<El, false, float, true, true,  true,  true>;
-
     static bool smem_raised = false;
     if (!smem_raised) {
         for (const void * kfn : {(const void *) kernel_00, (const void *) kernel_10,
                                  (const void *) kernel_01, (const void *) kernel_11,
                                  (const void *) kernel_s3_00, (const void *) kernel_s3_10,
-                                 (const void *) kernel_s3_01, (const void *) kernel_s3_11,
-                                 (const void *) regp_00, (const void *) regp_10,
-                                 (const void *) regp_01, (const void *) regp_11,
-                                 (const void *) regp_s3_00, (const void *) regp_s3_10,
-                                 (const void *) regp_s3_01, (const void *) regp_s3_11}) {
+                                 (const void *) kernel_s3_01, (const void *) kernel_s3_11}) {
             CUDA_CHECK(cudaFuncSetAttribute(kfn,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes));
         }
@@ -669,11 +579,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     float * partial_sum = partial_max + 3 * rows3;
 
     if (use_splitkv3) {
-        const auto kfn = use_regp
-            ? (k_direct ? (v_direct ? regp_s3_11 : regp_s3_10)
-                        : (v_direct ? regp_s3_01 : regp_s3_00))
-            : (k_direct ? (v_direct ? kernel_s3_11 : kernel_s3_10)
-                        : (v_direct ? kernel_s3_01 : kernel_s3_00));
+        const auto kfn = k_direct ? (v_direct ? kernel_s3_11 : kernel_s3_10)
+                                  : (v_direct ? kernel_s3_01 : kernel_s3_00);
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,
@@ -697,11 +604,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 nullptr, 0, 0,
                 partial_out, partial_max, partial_sum);
     } else {
-        const auto kfn = use_regp
-            ? (k_direct ? (v_direct ? regp_11 : regp_10)
-                        : (v_direct ? regp_01 : regp_00))
-            : (k_direct ? (v_direct ? kernel_11 : kernel_10)
-                        : (v_direct ? kernel_01 : kernel_00));
+        const auto kfn = k_direct ? (v_direct ? kernel_11 : kernel_10)
+                                  : (v_direct ? kernel_01 : kernel_00);
         kfn<<<grid, block, Traits::kSmemBytes, stream>>>(
                 (const El *) Qs,
                 (const El *) K_h2,
@@ -749,5 +653,4 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             Q->nb[1] / 8, Q->nb[2] / 8, Q->nb[3] / 8);
         CUDA_CHECK(cudaGetLastError());
     }
-
 }
