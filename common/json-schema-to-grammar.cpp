@@ -342,11 +342,15 @@ static size_t gbnf_escape_length(const std::string & pattern, size_t pos) {
 class common_chat_schema_converter {
 private:
     friend std::string build_grammar(const std::function<void(const common_grammar_builder &)> & cb, const common_grammar_options & options);
+    friend std::string json_schema_to_grammar(const common_chat_schema_document & schema);
     bool _dotall;
     std::map<std::string, std::string> _rules;
     std::unordered_set<std::string> _refs_being_resolved;
     std::vector<std::string> _errors;
     std::vector<std::string> _warnings;
+    // User-supplied schemas (json_schema field, response_format) fail closed: a pattern the grammar cannot express
+    // becomes an error instead of silently accepting any string. Tool-call schemas keep the lenient behaviour.
+    bool _strict_patterns = false;
 
     template <typename T>
     static const T & as(const common_chat_schema & node) {
@@ -394,6 +398,10 @@ private:
         } catch (const unsupported_pattern & err) {
             // revert rules
             _rules = std::move(rules_snapshot);
+            if (_strict_patterns) {
+                _errors.push_back("Unsupported pattern " + pattern + ": " + err.what());
+                return "";
+            }
             _warnings.push_back("pattern " + pattern + " is not supported (" + err.what() + "), accepting any string");
             return _add_rule(name, _add_primitive("string", PRIMITIVE_RULES.at("string")));
         } catch (const invalid_pattern & err) {
@@ -1007,6 +1015,7 @@ std::string json_schema_to_grammar(const common_json & schema, bool force_gbnf) 
 
 std::string json_schema_to_grammar(const common_chat_schema_document & schema) {
     common_chat_schema_converter converter(false);
+    converter._strict_patterns = true;
     converter.visit(*schema.root, "");
     converter.check_errors();
     return converter.format_grammar();
@@ -1019,7 +1028,10 @@ std::string build_grammar(const std::function<void(const common_grammar_builder 
             return converter._add_rule(name, rule);
         },
         /* .add_schema = */ [&](const std::string & name, const common_chat_schema & schema) {
-            return converter.add_schema(name == "root" ? "" : name, schema);
+            converter._strict_patterns = name == "response-format" || name == "response-format-schema";
+            auto rule = converter.add_schema(name == "root" ? "" : name, schema);
+            converter._strict_patterns = false;
+            return rule;
         },
     };
     cb(builder);
