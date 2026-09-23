@@ -424,6 +424,26 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    // Volta (sm_70): dp4a only on both MMVQ and MMQ paths. MMVQ has lower overhead
+    // for small batches (no Q8_1 quantization of activations needed). For Q4_K the
+    // per-column decode cost is high, so MMVQ wins up to batch 5 (MTP verify sweet spot).
+    // Above that, the MMQ tiling amortizes the decode better despite Ampere-tuned configs.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        // 22/09 : MMQ batch>=2 teste = 71.8ms @ b5 (palier 68ms des b2) vs MMVQ 61.4ms
+        // linéaire -> MMVQ gagne a tous les batchs decode, seuils par type conserves.
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 5;
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+                return ne11 <= 4;
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 6;
+            default:
+                return ne11 <= 8;
+        }
+    }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
@@ -451,6 +471,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        // 22/09 : nwarps=4 teste a ncols 5-8 sur Volta = 64.2ms @ b5 vs 61.4ms (2 warps) -> keep 2.
         switch (ncols_dst) {
             case 1:
             case 2:
